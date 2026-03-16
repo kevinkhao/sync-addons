@@ -49,3 +49,59 @@ class OAS(http.Controller):
             status=200,
             **response_params
         )
+
+    @http.route(
+        "/api/v1/<namespace_name>/swagger-ui",
+        type="http",
+        auth="none",
+        csrf=False,
+    )
+    def OAS_swagger_ui(self, namespace_name, **kwargs):
+        ensure_db()
+        namespace = (
+            http.request.env["openapi.namespace"]
+            .sudo()
+            .search([("name", "=", namespace_name)])
+        )
+        if not namespace:
+            raise werkzeug.exceptions.NotFound()
+        if namespace.token != kwargs.get("token"):
+            raise werkzeug.exceptions.Forbidden()
+
+        token_param = ""
+        if kwargs.get("token"):
+            token_param = "?token=%s" % kwargs["token"]
+
+        spec_url = "/api/v1/%s/swagger.json%s" % (namespace_name, token_param)
+
+        html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>%(title)s - Swagger UI</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+</head>
+<body>
+    <div id="swagger-ui"></div>
+    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+        SwaggerUIBundle({
+            url: "%(spec_url)s",
+            dom_id: "#swagger-ui",
+            presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+            layout: "BaseLayout",
+            deepLinking: true,
+        });
+    </script>
+</body>
+</html>""" % {
+            "title": namespace_name,
+            "spec_url": spec_url,
+        }
+
+        return werkzeug.wrappers.Response(
+            html,
+            status=200,
+            headers=[("Content-Type", "text/html; charset=utf-8")],
+        )

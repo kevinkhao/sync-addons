@@ -23,12 +23,14 @@ Todo:
 """
 import base64
 import functools
+import re
 import traceback
 
 import werkzeug.wrappers
 
 import odoo
 from odoo.http import request
+from odoo.modules.registry import Registry
 from odoo.service import security
 
 from odoo.addons.base_api.lib.pinguin import (
@@ -38,6 +40,7 @@ from odoo.addons.base_api.lib.pinguin import (
     get_model_for_read,
 )
 from odoo.addons.web.controllers.report import ReportController
+import logging
 
 try:
     import simplejson as json
@@ -94,6 +97,7 @@ CODE__no_api_worker = (
     "The API worker is currently not at work.",
 )
 
+_logger = logging.getLogger(__name__)
 
 def successful_response(status, data=None):
     """Successful responses wrapper.
@@ -127,25 +131,34 @@ def authenticate_token_for_user(token):
 
     :param str token: The raw access token.
 
-    :returns: User if token is authorized for the requested user.
-    :rtype odoo.models.Model
+    :returns: User ID if token is authorized
+    :rtype: int
 
     :raise: werkzeug.exceptions.HTTPException if user not found.
     """
-    user = request.env["res.users"].sudo().search([("openapi_token", "=", token)])
-    if user.exists():
-        # copy-pasted from odoo.http.py:OpenERPSession.authenticate()
-        request.session.uid = user.id
-        request.session.login = user.login
-        request.session.session_token = user.id and security.compute_session_token(
-            request.session, request.env
+    # Odoo 18: With auth="none", search for user and return user_id
+    # The environment will be created by the route decorator
+    with Registry(request.session.db).cursor() as cr:
+        env = odoo.api.Environment(cr, odoo.SUPERUSER_ID, {})
+        user = env["res.users"].search([("openapi_token", "=", token)])
+        
+        if not user.exists():
+            raise werkzeug.exceptions.HTTPException(
+                response=error_response(*CODE__no_user_auth)
+            )
+        
+        user_id = user.id
+        user_login = user.login
+        
+        # Configure session
+        request.session.uid = user_id
+        request.session.login = user_login
+        request.session.session_token = user_id and security.compute_session_token(
+            request.session, env
         )
-        request.update_env(user=user.id)
-
-        return user
-    raise werkzeug.exceptions.HTTPException(
-        response=error_response(*CODE__no_user_auth)
-    )
+        _logger.info("Authenticated user %s in database %s", user_login, request.session.db)
+    
+    return user_id
 
 
 def get_auth_header(headers, raise_exception=False):
@@ -194,40 +207,40 @@ def get_data_from_auth_header(header):
         ) from e
 
     if len(decoded_token_parts) == 1:
-        db_name, user_token = None, decoded_token_parts[0]
+        user_name, user_token, db_name = None, decoded_token_parts[0], None
     elif len(decoded_token_parts) == 2:
-        db_name, user_token = decoded_token_parts
+        user_name, user_token, db_name = decoded_token_parts[0], decoded_token_parts[1], None
+    elif len(decoded_token_parts) == 3:
+        user_name, user_token, db_name = decoded_token_parts
     else:
         err_descrip = (
             'Basic auth header payload must be of the form "<%s>" (encoded to base64)'
             % "user_token"
             if odoo.tools.config["dbfilter"]
-            else "db_name:user_token"
+            else "db_name:user_token:user_name"
         )
         raise werkzeug.exceptions.HTTPException(
             response=error_response(500, "Invalid header", err_descrip)
         )
 
-    return db_name, user_token
+    return db_name, user_token, user_name
 
 
-def setup_db(httprequest, db_name):
+def setup_db(db_name):
     """check and setup db in session by db name
 
-    :param httprequest: a wrapped werkzeug Request object
-    :type httprequest: :class:`werkzeug.wrappers.BaseRequest`
     :param str db_name: Database name.
 
     :raise: werkzeug.exceptions.HTTPException if the database not found.
     """
-    if httprequest.session.db:
+    if request.session.db != db_name:
+        if db_name not in odoo.service.db.list_dbs(force=True):
+            raise werkzeug.exceptions.HTTPException(
+                response=error_response(*CODE__db_not_found)
+            )
+        request.session.db = db_name
+    else:
         return
-    if db_name not in odoo.service.db.list_dbs(force=True):
-        raise werkzeug.exceptions.HTTPException(
-            response=error_response(*CODE__db_not_found)
-        )
-
-    httprequest.session.db = db_name
 
 
 ###################
@@ -251,6 +264,12 @@ def get_namespace_by_name_from_users_namespaces(
     :raise: werkzeug.exceptions.HTTPException if the namespace is not contained
                                               in allowed user namespaces.
     """
+    # Odoo 18: Ensure request.env is initialized
+    if not request.env:
+        raise werkzeug.exceptions.HTTPException(
+            response=error_response(*CODE__no_user_auth)
+        )
+    
     namespace = request.env["openapi.namespace"].search([("name", "=", namespace_name)])
 
     if not namespace.exists() and raise_exception:
@@ -273,7 +292,7 @@ def create_log_record(**kwargs):
     # request (we cannot use second cursor and we cannot use aborted
     # transaction)
     if not test_mode:
-        with odoo.registry(request.session.db).cursor() as cr:
+        with Registry(request.session.db).cursor() as cr:
             # use new to save data even in case of an error in the old cursor
             env = odoo.api.Environment(cr, request.session.uid, {})
             _create_log_record(env, **kwargs)
@@ -344,44 +363,61 @@ def route(controller_method):
 
         @functools.wraps(controller_method)
         def controller_method_wrapper(*iargs, **ikwargs):
-
             auth_header = get_auth_header(
                 request.httprequest.headers, raise_exception=True
             )
-            db_name, user_token = get_data_from_auth_header(auth_header)
-            authenticated_user = authenticate_token_for_user(user_token)
-            namespace = get_namespace_by_name_from_users_namespaces(
-                authenticated_user, ikwargs["namespace"], raise_exception=True
-            )
-            data_for_log = {
-                "namespace_id": namespace.id,
-                "namespace_log_request": namespace.log_request,
-                "namespace_log_response": namespace.log_response,
-                "user_id": authenticated_user.id,
-                "user_request": None,
-                "user_response": None,
-            }
+            db_name, user_token, _user_name = get_data_from_auth_header(auth_header)
+            if db_name:
+                setup_db(db_name)
 
-            try:
-                response = controller_method(*iargs, **ikwargs)
-            except werkzeug.exceptions.HTTPException as e:
-                response = e.response
-            except Exception as e:
-                traceback.print_exc()
-                if hasattr(e, "error") and isinstance(e.error, Exception):
-                    e = e.error
-                response = error_response(
-                    status=500,
-                    error=type(e).__name__,
-                    error_descrip=e.name if hasattr(e, "name") else str(e),
+            # Authenticate and get user_id (uses its own cursor internally)
+            user_id = authenticate_token_for_user(user_token)
+
+            # auth="none" routes are served by _serve_nodb(), which does NOT
+            # set up request.env. We must create our own cursor.
+            # Use the cursor as a context manager (with cr:), NOT
+            # contextlib.closing(cr):
+            #   contextlib.closing → close() → rollback() → writes LOST
+            #   with cr → commit() on success / rollback() on exception → correct
+            registry = Registry(request.session.db)
+            with registry.cursor() as cr:
+                request.registry = registry
+                request.env = odoo.api.Environment(cr, user_id, request.session.context)
+
+                authenticated_user = request.env["res.users"].browse(user_id)
+
+                namespace = get_namespace_by_name_from_users_namespaces(
+                    authenticated_user, ikwargs["namespace"], raise_exception=True
                 )
+                data_for_log = {
+                    "namespace_id": namespace.id,
+                    "namespace_log_request": namespace.log_request,
+                    "namespace_log_response": namespace.log_response,
+                    "user_id": authenticated_user.id,
+                    "user_request": None,
+                    "user_response": None,
+                }
 
-            data_for_log.update(
-                {"user_request": request.httprequest, "user_response": response}
-            )
-            create_log_record(**data_for_log)
+                try:
+                    response = controller_method(*iargs, **ikwargs)
+                except werkzeug.exceptions.HTTPException as e:
+                    response = e.response
+                except Exception as e:
+                    traceback.print_exc()
+                    if hasattr(e, "error") and isinstance(e.error, Exception):
+                        e = e.error
+                    response = error_response(
+                        status=500,
+                        error=type(e).__name__,
+                        error_descrip=e.name if hasattr(e, "name") else str(e),
+                    )
 
-            return response
+                data_for_log.update(
+                    {"user_request": request.httprequest, "user_response": response}
+                )
+                create_log_record(**data_for_log)
+
+                return response
 
         return controller_method_wrapper
 
@@ -410,10 +446,8 @@ def get_create_context(namespace, model, canned_context):
     :rtype: dict
     :raise: werkzeug.exceptions.HTTPException TODO: add description in which case
     """
-    cr, uid = request.cr, request.session.uid
-
-    # Singleton by construction (_sql_constraints)
-    openapi_access = request.env(cr, uid)["openapi.access"].search(
+    # Odoo 18: Use request.env directly instead of request.env(cr, uid)
+    openapi_access = request.env["openapi.access"].search(
         [("model_id", "=", model), ("namespace_id.name", "=", namespace)]
     )
 
@@ -480,10 +514,9 @@ def get_model_openapi_access(namespace, model):
     :raise: werkzeug.exceptions.HTTPException if the namespace has no accesses.
     """
     # TODO: this method has code duplicates with openapi specification code (e.g. get_OAS_definitions_part)
-    cr, uid = request.cr, request.session.uid
-    # Singleton by construction (_sql_constraints)
+    # Odoo 18: Use request.env directly instead of request.env(cr, uid)
     openapi_access = (
-        request.env(cr, uid)["openapi.access"]
+        request.env["openapi.access"]
         .sudo()
         .search([("model_id", "=", model), ("namespace_id.name", "=", namespace)])
     )
@@ -625,8 +658,8 @@ def wrap__resource__update_one(modelname, id, success_code, data):
               otherwise error response
     :rtype: werkzeug.wrappers.Response
     """
-    cr, uid = request.cr, request.session.uid
-    record = request.env(cr, uid)[modelname].browse(id)
+    # Odoo 18: Use request.env directly instead of request.env(cr, uid)
+    record = request.env[modelname].browse(id)
     if not record.exists():
         return error_response(*CODE__obj_not_found)
     try:
@@ -647,8 +680,8 @@ def wrap__resource__unlink_one(modelname, id, success_code):
               otherwise error response
     :rtype: werkzeug.wrappers.Response
     """
-    cr, uid = request.cr, request.session.uid
-    record = request.env(cr, uid)[modelname].browse([id])
+    # Odoo 18: Use request.env directly instead of request.env(cr, uid)
+    record = request.env[modelname].browse([id])
     if not record.exists():
         return error_response(*CODE__obj_not_found)
     record.unlink()
@@ -860,6 +893,8 @@ def get_OAS_definitions_part(
     fields_meta = model_obj.fields_get(export_fields_dict.keys())
 
     for field, child_fields in export_fields_dict.items():
+        if field not in fields_meta.keys():
+            continue
         meta = fields_meta[field]
         if child_fields:
             child_model = model_obj.env[meta["relation"]]

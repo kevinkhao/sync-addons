@@ -188,6 +188,7 @@
                             <field name="last_log_date" readonly="1" />
                             <field name="token" />
                             <field name="spec_url" widget="url" readonly="1" />
+                            <field name="doc_spec_url" widget="url" readonly="1" />
                         </group>
                     </div>
                     <notebook>

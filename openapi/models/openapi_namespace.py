@@ -60,6 +60,7 @@ class Namespace(models.Model):
         help="Token passed by a query string parameter to access the specification.",
     )
     spec_url = fields.Char("Specification Link", compute="_compute_spec_url")
+    doc_spec_url = fields.Char("Doc Link", compute="_compute_spec_url")
 
     _sql_constraints = [
         (
@@ -224,6 +225,12 @@ class Namespace(models.Model):
         base_url = self.env["ir.config_parameter"].sudo().get_param("web.base.url")
         for record in self:
             record.spec_url = "{}/api/v1/{}/swagger.json?token={}&db={}".format(
+                base_url,
+                record.name,
+                record.token,
+                self._cr.dbname,
+            )
+            record.doc_spec_url = "{}/api/v1/{}/swagger-ui?token={}&db={}".format(
                 base_url,
                 record.name,
                 record.token,
